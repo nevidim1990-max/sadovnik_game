@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>Universal Platformer Core</title>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+<style>
+  html,body{margin:0;padding:0;background:#0a0a12;color:#eee;font-family:system-ui,sans-serif;overflow:hidden;}
+  #game{width:100vw;height:100vh;}
+  #banner{position:fixed;top:8px;left:50%;transform:translateX(-50%);background:#0008;padding:6px 12px;border-radius:6px;font-size:12px;z-index:5;}
+</style>
+</head>
+<body>
+<div id="game"></div>
+<div id="banner">Universal Platformer Core · Phase 0-1 Delivery</div>
+<script>
+/* ============================================================
+   UNIVERSAL PLATFORMER CORE — Phase 0-1
+   7-layer architecture:
+   1) ECS     2) Systems   3) EventBus   4) RuleEngine
+   5) ModifierStack   6) FSM   7) LayeredRender + FixedLoop
+   ============================================================ */
+
+// ---------- ENGINE_CONFIG (technical only) ----------
+const ENGINE_CONFIG = {
+  debug: new URLSearchParams(location.search).get('debug') === '1',
+  fixedDt: 1/60,
+  gravity: 1600,
+  tile: 32,
+  cameraLerp: 0.12
+};
+
+// ============================================================
+// LAYER 3 — EVENT BUS
+// ============================================================
+class EventBus {
+  constructor(){ this.subs = new Map(); this.queue = []; }
+  on(evt, fn){ if(!this.subs.has(evt)) this.subs.set(evt, new Set()); this.subs.get(evt).add(fn); return () => this.off(evt, fn); }
+  off(evt, fn){ const s=this.subs.get(evt); if(s) s.delete(fn); }
+  emit(evt, payload){
+    const s = this.subs.get(evt); if(!s) return;
+    for(const fn of Array.from(s)) { try { fn(payload); } catch(e){ console.error('[EventBus]', evt, e); } }
+  }
+  emitNextFrame(evt, payload){ this.queue.push([evt, payload]); }
+  flushQueue(){ const q=this.queue; this.queue=[]; for(const [e,p] of q) this.emit(e,p); }
+}
+
+// ============================================================
+// LAYER 1 — ECS (Entity = ID; Component = POD)
+// ============================================================
+class ECS {
+  constructor(){ this.nextId = 1; this.entities = new Map(); this.destroyed = new Set(); }
+  create(components = {}) {
+    const id = this.nextId++;
+    const map = new Map();
+    for (const [k, v] of Object.entries(components)) map.set(k, Object.assign({}, v));
+    this.entities.set(id, { id, components: map });
+    return id;
+  }
+  add(id, name, data = {}) {
+    const e = this.entities.get(id); if(!e) return;
+    e.components.set(name, Object.assign({}, data));
+  }
+  remove(id, name){ const e = this.entities.get(id); if(e) e.components.delete(name); }
+  has(id, name){ const e = this.entities.get(id); return e && e.components.has(name); }
+  get(id, name){ const e = this.entities.get(id); return e && e.components.get(name); }
+  destroy(id){ this.entities.delete(id); this.destroyed.add(id); }
+  query(...names){
+    const res = [];
+    for(const [id, e] of this.entities) {
+      let ok = true;
+      for(const n of names) if(!e.components.has(n)) { ok = false; break; }
+      if(ok) res.push(id);
+    }
+    return res;
+  }
+}
+
+// ============================================================
+// LAYER 5 — MODIFIER STACK
+// ============================================================
+class ModifierStack {
+  constructor(){ this.entries = new Map(); }
+  add(target, mod){ // {type:'FLAT'|'MULT'|'CONDITIONAL', value, source, duration, priority}
+    if(!this.entries.has(target)) this.entries.set(target, []);
+    this.entries.get(target).push(Object.assign({priority:0, duration:-1, age:0}, mod));
+  }
+  tick(dt){
+    for(const [k, arr] of this.entries){
+      for(const m of arr) if(m.duration > 0) { m.age += dt; }
+      this.entries.set(k, arr.filter(m => m.duration < 0 || m.age < m.duration));
+    }
+  }
+  resolve(target, base){
+    const arr = (this.entries.get(target)||[]).slice().sort((a,b)=>a.priority-b.priority);
+    let flat = 0, mult = 1;
+    for(const m of arr){
+      if(m.type === 'FLAT') flat += m.value;
+      else if(m.type === 'MULT') mult *= m.value;
+      // CONDITIONAL handled by RuleEngine
+    }
+    return (base + flat) * mult;
+  }
+}
+
+// ============================================================
+// LAYER 4 — RULE ENGINE (data-driven)
+// ============================================================
+class RuleEngine {
+  constructor(ecs, bus){ this.ecs = ecs; this.bus = bus; this.rules = []; this.eventLog = []; }
+  loadRules(rules){ this.rules = (rules||[]).slice().sort((a,b)=>(b.priority||0)-(a.priority||0)); }
+  evaluateEvent(evt, payload){
+    for(const rule of this.rules){
+      if(!rule.condition) continue;
+      let ok = true;
+      for(const c of rule.condition){
+        if(c.type === 'EventMatch' && c.event !== evt) { ok = false; break; }
+      }
+      if(ok) this.applyEffects(rule.effect, {event: evt, payload});
+    }
+  }
+  applyEffects(effects, ctx){
+    for(const e of effects||[]){
+      if(e.type === 'EmitEvent') this.bus.emit(e.event, e.payload || ctx.payload);
+      else if(e.type === 'ApplyModifier') { /* handled by gameplay code */ }
+    }
+  }
+}
+
+// ============================================================
+// LAYER 6 — FSM
+// ============================================================
+class FSM {
+  constructor(id, states, initial){ this.id = id; this.states = states; this.current = initial; }
+  update(ctx, dt){
+    const st = this.states[this.current]; if(!st) return;
+    if(st.onUpdate) st.onUpdate(ctx, dt);
+    for(const t of st.transitions || []){
+      if(t.condition(ctx)) {
+        if(st.onExit) st.onExit(ctx);
+        this.current = t.to;
+        const ns = this.states[this.current];
+        if(ns && ns.onEnter) ns.onEnter(ctx);
+        break;
+      }
+    }
+  }
+}
+
+// ============================================================
+// LAYER 2 — SYSTEMS
+// ============================================================
+class System {
+  constructor(id, ecs, bus){ this.id = id; this.ecs = ecs; this.bus = bus; }
+  initialize(){}
+  update(dt){}
+  shutdown(){}
+}
+
+class InputSystem extends System {
+  constructor(ecs, bus){ super('InputSystem', ecs, bus); this.cmd = {left:false,right:false,jump:false,dash:false}; }
+  initialize(){
+    const k = this.ecs /* not used directly */;
+  }
+  setCommand(c, v){ if(this.cmd[c] !== v){ this.cmd[c] = v; if(v) this.bus.emit('CORE_ACTION_PERFORMED', {cmd:c}); } }
+  update(){}
+}
+
+class MovementSystem extends System {
+  update(dt){
+    for(const id of this.ecs.query('Transform','Velocity')){
+      const t = this.ecs.get(id,'Transform');
+      const v = this.ecs.get(id,'Velocity');
+      t.x += v.vx * dt;
+      t.y += v.vy * dt;
+    }
+  }
+}
+
+class GravitySystem extends System {
+  update(dt){
+    for(const id of this.ecs.query('Velocity','Gravity')){
+      const v = this.ecs.get(id,'Velocity');
+      v.vy += ENGINE_CONFIG.gravity * dt;
+      if(v.vy > 1600) v.vy = 1600;
+    }
+  }
+}
+
+class AISystem extends System {
+  update(dt){
+    for(const id of this.ecs.query('Transform','Velocity','EnemyTag','FSM')){
+      const t = this.ecs.get(id,'Transform');
+      const v = this.ecs.get(id,'Velocity');
+      const fsm = this.ecs.get(id,'FSM');
+      const e = this.ecs.get(id,'EnemyTag');
+      const px = this._playerX ? this._playerX() : 0;
+      const py = this._playerY ? this._playerY() : 0;
+      const dx = px - t.x, dy = py - t.y;
+      const dist = Math.hypot(dx,dy);
+      const ctx = { self:{t,v,e}, dx, dy, dist };
+      fsm.update(ctx, dt);
+      // apply behavior per state
+      if(fsm.current === 'patrol') v.vx = e.speed * (e.dir||1);
+      else if(fsm.current === 'chase') { const s=Math.sign(dx)||1; v.vx = e.speed*1.4*s; }
+      else if(fsm.current === 'idle') v.vx = 0;
+      // flip on wall
+      if(v.vx !== 0 && (t.x < 40 || t.x > (this._worldW?this._worldW():1200))) { e.dir = -e.dir; }
+    }
+  }
+  bindPlayer(px, py, w){ this._playerX = px; this._playerY = py; this._worldW = w; }
+}
+
+class CollisionSystem extends System {
+  constructor(ecs,bus){ super('CollisionSystem',ecs,bus); this.staticRects = []; }
+  setStatic(rects){ this.staticRects = rects; }
+  update(dt){
+    // simple AABB for gameplay layer entities vs statics
+    const movers = this.ecs.query('Transform','Collider').filter(id => !this.ecs.has(id,'DecorationTag'));
+    for(const id of movers){
+      const t = this.ecs.get(id,'Transform');
+      const c = this.ecs.get(id,'Collider');
+      if(c.static) continue;
+      const w = c.w, h = c.h;
+      let onGround = false;
+      for(const r of this.staticRects){
+        // vertical landing
+        if(t.x + w/2 > r.x && t.x - w/2 < r.x + r.w){
+          if(t.y + h/2 > r.y && t.y + h/2 < r.y + r.h + 20 && (this.ecs.get(id,'Velocity')?.vy||0) >= 0){
+            t.y = r.y - h/2;
+            const v = this.ecs.get(id,'Velocity'); if(v) v.vy = 0;
+            onGround = true;
+          }
+        }
+        // horizontal
+        if(t.y + h/2 > r.y && t.y - h/2 < r.y + r.h){
+          if(t.x + w/2 > r.x && t.x - w/2 < r.x + r.w){
+            // push out horizontally
+            const overlapL = (t.x + w/2) - r.x;
+            const overlapR = (r.x + r.w) - (t.x - w/2);
+            if(overlapL < overlapR) t.x -= overlapL;
+            else t.x += overlapR;
+            const v = this.ecs.get(id,'Velocity'); if(v) v.vx = 0;
+          }
+        }
+      }
+      if(this.ecs.has(id,'PlayerTag')) this.ecs.get(id,'PlayerTag').onGround = onGround;
+    }
+  }
+}
+
+class DeathSystem extends System {
+  update(dt){
+    const players = this.ecs.query('Transform','PlayerTag');
+    for(const pid of players){
+      const p = this.ecs.get(pid,'Transform');
+      // fell out of world
+      if(p.y > 2000) this.bus.emit('PLAYER_DIED', {reason:'fall'});
+      // trap contact
+      for(const tid of this.ecs.query('Transform','TrapTag')){
+        const t = this.ecs.get(tid,'Transform');
+        if(Math.abs(t.x - p.x) < 20 && Math.abs(t.y - p.y) < 20) this.bus.emit('PLAYER_DIED',{reason:'trap'});
+      }
+      // coin pickup
+      for(const cid of this.ecs.query('Transform','CoinTag')){
+        const c = this.ecs.get(cid,'Transform');
+        if(Math.abs(c.x - p.x) < 22 && Math.abs(c.y - p.y) < 22){
+          this.ecs.destroy(cid);
+          this.bus.emit('COIN_COLLECTED', {value: this.ecs.get(cid,'CoinTag')?.value || 1});
+        }
+      }
+      // goal
+      for(const gid of this.ecs.query('Transform','GoalTag')){
+        const g = this.ecs.get(gid,'Transform');
+        if(Math.abs(g.x - p.x) < 30 && Math.abs(g.y - p.y) < 40) this.bus.emit('MICRO_PHASE_COMPLETED',{});
+      }
+      // enemy stomp (player falls onto enemy)
+      for(const eid of this.ecs.query('Transform','EnemyTag')){
+        const e = this.ecs.get(eid,'Transform');
+        const pv = this.ecs.get(pid,'Velocity');
+        if(Math.abs(e.x - p.x) < 22 && Math.abs(e.y - p.y) < 22){
+          if(pv && pv.vy > 100 && p.y < e.y - 6){
+            this.ecs.destroy(eid);
+            this.bus.emit('ENEMY_KILLED', {});
+            pv.vy = -520;
+          } else {
+            this.bus.emit('PLAYER_DIED', {reason:'enemy'});
+          }
+        }
+      }
+    }
+  }
+}
+
+class CheckpointSystem extends System {
+  constructor(ecs,bus){ super('CheckpointSystem',ecs,bus); this.checkpoint = null; this.checkpoints = []; }
+  register(cp){ this.checkpoints.push(cp); }
+  clear(){ this.checkpoints = []; this.checkpoint = null; }
+  update(){
+    const players = this.ecs.query('Transform','PlayerTag'); if(!players.length) return;
+    const p = this.ecs.get(players[0],'Transform');
+    for(const cp of this.checkpoints){
+      if(!cp.reached && Math.abs(p.x - cp.x) < 40 && Math.abs(p.y - cp.y) < 60){
+        cp.reached = true; this.checkpoint = {x: cp.x, y: cp.y - 40};
+        this.bus.emit('CHECKPOINT_REACHED', {id: cp.id});
+      }
+    }
+  }
+}
+
+// ============================================================
+// LAYER 7 — LAYERED RENDER SYSTEM (with parallax + decorations)
+// ============================================================
+class RenderSystem extends System {
+  constructor(ecs, bus, scene){
+    super('RenderSystem', ecs, bus);
+    this.scene = scene;
+    this.visuals = new Map();
+    this.decoVisuals = [];
+    this.camera = scene.cameras.main;
+  }
+  clearAll(){
+    for(const [, obj] of this.visuals) obj.destroy();
+    this.visuals.clear();
+    for(const d of this.decoVisuals) d.destroy();
+    this.decoVisuals = [];
+  }
+  createVisual(id){
+    const ecs = this.ecs;
+    const sp = ecs.get(id,'Sprite'); if(!sp) return;
+    const t = ecs.get(id,'Transform');
+    const layerKey = sp.layer || 'gameplay';
+    const depth = sp.z != null ? sp.z : 0;
+    let obj;
+    if(sp.shape === 'circle') obj = this.scene.add.circle(t.x, t.y, sp.w/2, sp.color);
+    else obj = this.scene.add.rectangle(t.x, t.y, sp.w, sp.h, sp.color);
+    obj.setDepth(layerKey === 'background_far' ? -300 :
+                 layerKey === 'background_mid' ? -200 :
+                 layerKey === 'background_near' ? -100 :
+                 layerKey === 'foreground' ? 100 + depth :
+                 layerKey === 'ui' ? 1000 : depth);
+    this.visuals.set(id, obj);
+    // micro-animation
+    const anim = ecs.get(id,'Animated');
+    if(anim && anim.animation_class && anim.animation_class !== 'none'){
+      this.applyIdleAnimation(obj, anim.animation_class);
+    }
+    // hover / interact on gameplay objects
+    if(anim && anim.interaction_class && anim.interaction_class !== 'none'){
+      obj.setInteractive && obj.setInteractive();
+      obj.on && obj.on('pointerover', () => this.applyHover(obj, anim.interaction_class));
+      obj.on && obj.on('pointerdown', () => this.applyInteract(obj, anim.interaction_class));
+    }
+  }
+  applyIdleAnimation(obj, cls){
+    // NOTE: anim-idle only applied to selected entities (data-driven).
+    if(cls === 'anim-idle'){
+      this.scene.tweens.add({targets:obj, y: obj.y - 3, duration: 900, yoyo:true, repeat:-1, ease:'Sine.easeInOut'});
+    } else if(cls === 'anim-pulse'){
+      this.scene.tweens.add({targets:obj, scale: 1.08, duration: 700, yoyo:true, repeat:-1, ease:'Sine.easeInOut'});
+    }
+  }
+  applyHover(obj){
+    this.scene.tweens.add({targets:obj, scale: 1.1, duration: 150});
+  }
+  applyInteract(obj){
+    this.scene.tweens.add({targets:obj, scaleX: 1.1, scaleY: 0.9, duration: 100, yoyo:true, onComplete:()=>obj.setScale(1)});
+  }
+  createDecoration(dec){
+    // dec: { shape, color, w, h, x, y, render_layer, z_index, parallax_factor }
+    let obj;
+    if(dec.shape === 'circle') obj = this.scene.add.circle(dec.x, dec.y, dec.w/2, dec.color);
+    else obj = this.scene.add.rectangle(dec.x, dec.y, dec.w, dec.h, dec.color);
+    obj.setAlpha(0.85);
+    const layerMap = {
+      background_far:  {z: -300, parallax: dec.parallax_factor ?? 0.15},
+      background_mid:  {z: -200, parallax: dec.parallax_factor ?? 0.40},
+      background_near: {z: -100, parallax: dec.parallax_factor ?? 0.70},
+      foreground:      {z:  100 + (dec.z_index||0), parallax: 0}
+    };
+    const lm = layerMap[dec.render_layer] || layerMap.background_mid;
+    obj.setDepth(lm.z + (dec.z_index||0));
+    obj.__parallax = lm.parallax;
+    obj.__baseX = dec.x;
+    obj.__baseY = dec.y;
+    this.decoVisuals.push(obj);
+  }
+  updateParallax(){
+    const cam = this.camera;
+    for(const d of this.decoVisuals){
+      if(!d.__parallax) continue;
+      d.x = d.__baseX - cam.scrollX * d.__parallax;
+      d.y = d.__baseY - cam.scrollY * d.__parallax;
+    }
+  }
+  update(){
+    // sync visuals to transforms
+    for(const id of this.ecs.query('Transform')){
+      let obj = this.visuals.get(id);
+      if(!obj) { this.createVisual(id); obj = this.visuals.get(id); }
+      if(!obj) continue;
+      const t = this.ecs.get(id,'Transform');
+      obj.x = t.x; obj.y = t.y;
+      // hide visual if pending destruction is not destroyed
+      if(!this.ecs.entities.has(id) && this.visuals.has(id)){
+        obj.destroy(); this.visuals.delete(id);
+      }
+    }
+    // destroy visuals for missing entities
+    for(const [id, obj] of Array.from(this.visuals)){
+      if(!this.ecs.entities.has(id)){ obj.destroy(); this.visuals.delete(id); }
+    }
+    this.updateParallax();
+  }
+}
+
+// ============================================================
+// JUICE SYSTEM
+// ============================================================
+class JuiceSystem extends System {
+  constructor(ecs, bus, scene){ super('JuiceSystem', ecs, bus); this.scene = scene; }
+  initialize(){
+    this.bus.on('COIN_COLLECTED', () => this.cameraShake(80, 0.003));
+    this.bus.on('ENEMY_KILLED',   () => this.cameraShake(120, 0.005));
+    this.bus.on('PLAYER_DIED',    () => this.cameraShake(220, 0.01));
+    this.bus.on('CHECKPOINT_REACHED', () => this.cameraShake(60, 0.002));
+  }
+  cameraShake(dur, intensity){ try{ this.scene.cameras.main.shake(dur, intensity); }catch(e){} }
+}
+
+// ============================================================
+// PLATFORM ADAPTER (with fallback)
+// ============================================================
+const PlatformAdapter = {
+  initialized:false,
+  init(){
+    this.initialized = true;
+    try {
+      // Yandex/Poki/CrazyGames SDKs would be detected here.
+      if(window.YaGames) { /* ... */ }
+    } catch(e){ console.warn('[PlatformAdapter] fallback', e); }
+    bus.emit('PLATFORM_INITIALIZED', {sdk: 'fallback'});
+  },
+  gameplayStart(){ try{ window.YaGames?.features?.GameplayAPI?.start?.(); }catch(e){} },
+  gameplayStop(){  try{ window.YaGames?.features?.GameplayAPI?.stop?.();  }catch(e){} },
+  isAdAvailable(){ return false; },
+  rewardAd(){ bus.emit('AD_RESULT', {status:'not_available'}); return Promise.resolve({status:'not_available'}); },
+  interstitialAd(){ bus.emit('AD_RESULT', {status:'not_available'}); return Promise.resolve({status:'not_available'}); },
+  submitScore(){}
+};
+
+// ============================================================
+// SAVE SYSTEM
+// ============================================================
+const SaveSystem = {
+  VERSION: 1,
+  key(){ return (GAME_DATA?.theme?.save_key) || 'universal_platformer_save'; },
+  load(){
+    try {
+      const raw = localStorage.getItem(this.key());
+      if(!raw) return this.defaults();
+      const data = JSON.parse(raw);
+      if(!data.version || data.version < this.VERSION) return this.migrate(data);
+      return data;
+    } catch(e){
+      console.warn('[SaveSystem] corrupt save, resetting.', e);
+      bus.emit('ERROR_REPORTED', {source:'save', severity:'warn', context:e.message});
+      return this.defaults();
+    }
+  },
+  defaults(){
+    return {
+      version: this.VERSION,
+      coins: 0, score: 0,
+      unlocked_upgrades: [],
+      achievements: {},
+      settings: { music:1, sfx:1, effects:'high', language:'en' },
+      last_checkpoint: null
+    };
+  },
+  migrate(old){ const d = Object.assign(this.defaults(), old); d.version = this.VERSION; return d; },
+  save(state){ try{ localStorage.setItem(this.key(), JSON.stringify(state)); }catch(e){ console.warn(e); } },
+  patch(partial){
+    const s = this.load();
+    Object.assign(s, partial);
+    this.save(s);
+    return s;
+  }
+};
+
+// ============================================================
+// VALIDATION
+// ============================================================
+function validateGameData(data){
+  const issues = [];
+  if(!data) { issues.push({level:'error', msg:'GAME_DATA missing'}); return {ok:false, issues}; }
+  if(!data.theme) issues.push({level:'warn', msg:'theme missing'});
+  if(!data.entities) issues.push({level:'warn', msg:'entities missing'});
+  if(!data.progression) issues.push({level:'warn', msg:'progression missing'});
+  else {
+    const levels = data.progression.stages_or_levels || [];
+    for(const lv of levels){
+      const micro = lv.micro_phases || [];
+      if(!micro.length) issues.push({level:'warn', msg:`level ${lv.level_id} has no micro_phases`});
+      for(const m of micro){
+        if(!m.decorative_layout) issues.push({level:'warn', msg:`micro ${m.micro_level_id} missing decorative_layout`});
+        if(!m.entities_in_zone) issues.push({level:'warn', msg:`micro ${m.micro_level_id} missing entities_in_zone`});
+      }
+    }
+  }
+  return {ok: issues.filter(i=>i.level==='error').length===0, issues};
+}
+
+// ============================================================
+// GLOBAL STATE
+// ============================================================
+const bus = new EventBus();
+const ecs = new ECS();
+const modifiers = new ModifierStack();
+const ruleEngine = new RuleEngine(ecs, bus);
+
+let GAME_DATA = window.GAME_DATA || null;
+let SYSTEMS = [];
+let inputSystem, aiSystem, collisionSystem, checkpointSystem, renderSystem, juiceSystem;
+let SESSION = {
+  levelIndex: 0,
+  microIndex: 0,
+  score: 0,
+  coins: 0,
+  startedAt: 0,
+  hp: 1
+};
+
+// ============================================================
+// SCENES
+// ============================================================
+
+class BootScene extends Phaser.Scene {
+  constructor(){ super('BootScene'); }
+  create(){
+    const w = this.scale.width, h = this.scale.height;
+    this.add.text(w/2, h/2, 'Loading engine...', {color:'#eee', fontSize:'20px'}).setOrigin(0.5);
+
+    // load GAME_DATA from window or fetch
+    const finish = (data) => {
+      GAME_DATA = data || GAME_DATA;
+      const v = validateGameData(GAME_DATA);
+      if(!v.ok || ENGINE_CONFIG.debug){
+        console.log('[Validation]', v);
+      }
+      if(!GAME_DATA) GAME_DATA = syntheticGameData();
+      this.scene.start('PreloadScene');
+    };
+    if(GAME_DATA){ finish(GAME_DATA); }
+    else {
+      // try fetch (factory layout)
+      Promise.all([
+        fetch('data/theme.json').then(r=>r.ok?r.json():null).catch(()=>null),
+        fetch('data/lore.json').then(r=>r.ok?r.json():null).catch(()=>null),
+        fetch('data/entities.json').then(r=>r.ok?r.json():null).catch(()=>null),
+        fetch('data/progression.json').then(r=>r.ok?r.json():null).catch(()=>null),
+        fetch('data/asset_spec.json').then(r=>r.ok?r.json():null).catch(()=>null)
+      ]).then(([theme,lore,entities,progression,assets]) => {
+        if(theme || entities || progression){
+          finish({theme, lore, entities, progression, assets});
+        } else finish(syntheticGameData());
+      }).catch(()=>finish(syntheticGameData()));
+    }
+  }
+}
+
+class PreloadScene extends Phaser.Scene {
+  constructor(){ super('PreloadScene'); }
+  create(){
+    const w = this.scale.width, h = this.scale.height;
+    this.add.text(w/2, h/2 - 20, 'Preloading assets...', {color:'#eee', fontSize:'20px'}).setOrigin(0.5);
+    const bar = this.add.rectangle(w/2, h/2 + 20, 0, 14, 0x66ccff).setOrigin(0,0.5);
+    const target = 300;
+    this.tweens.add({targets: bar, width: target, duration: 600, onComplete: ()=> this.scene.start('MenuScene')});
+    // Placeholder asset generation (no external assets required)
+  }
+}
+
+class MenuScene extends Phaser.Scene {
+  constructor(){ super('MenuScene'); }
+  create(){
+    const {width:w, height:h} = this.scale;
+    const palette = GAME_DATA?.theme?.palette || {};
+    this.cameras.main.setBackgroundColor(palette.bg || '#0a0a12');
+
+    this.add.text(w/2, h*0.25, (GAME_DATA?.theme?.texts?.title) || 'Universal Platformer', {color:'#fff', fontSize:'38px', fontStyle:'bold'}).setOrigin(0.5);
+    this.add.text(w/2, h*0.35, (GAME_DATA?.lore?.world_summary) || 'A data-driven platformer.', {color:'#ccc', fontSize:'14px', wordWrap:{width:w*0.7}}).setOrigin(0.5);
+
+    this.button(w/2, h*0.55, 'START', () => this.startGame());
+    this.button(w/2, h*0.65, 'SETTINGS', () => this.showSettings());
+    this.button(w/2, h*0.75, 'ACHIEVEMENTS', () => this.showAchievements());
+
+    bus.emit('SESSION_STARTED', {});
+  }
+  button(x, y, text, cb){
+    const t = this.add.text(x, y, text, {color:'#fff', fontSize:'22px', backgroundColor:'#222', padding:{x:16,y:8}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+    t.on('pointerover', () => this.tweens.add({targets:t, scale:1.08, duration:120}));
+    t.on('pointerout',  () => this.tweens.add({targets:t, scale:1,    duration:120}));
+    t.on('pointerdown', () => { this.tweens.add({targets:t, scaleX:1.1, scaleY:0.9, duration:80, yoyo:true, onComplete:cb}); });
+  }
+  startGame(){ this.scene.start('GameScene'); this.scene.launch('HUDScene'); }
+  showSettings(){ this.scene.start('SettingsScene'); }
+  showAchievements(){ this.scene.start('AchievementsScene'); }
+}
+
+class GameScene extends Phaser.Scene {
+  constructor(){ super('GameScene'); }
+  create(){
+    this.setupSystems();
+    this.bindInput();
+    this.loadLevel(0);
+
+    bus.on('PLAYER_DIED', () => this.respawn());
+    bus.on('MICRO_PHASE_COMPLETED', () => this.nextMicroPhase());
+    bus.on('CHECKPOINT_REACHED', () => { PlatformAdapter.gameplayStart(); });
+
+    this.tweens.add({targets:this.cameras.main, zoom:1, duration:0});
+
+    PlatformAdapter.gameplayStart();
+    bus.emit('GAMEPLAY_START', {});
+  }
+
+  setupSystems(){
+    inputSystem = new InputSystem(ecs, bus);
+    aiSystem = new AISystem(ecs, bus);
+    collisionSystem = new CollisionSystem(ecs, bus);
+    checkpointSystem = new CheckpointSystem(ecs, bus);
+    renderSystem = new RenderSystem(ecs, bus, this);
+    juiceSystem = new JuiceSystem(ecs, bus, this);
+
+    SYSTEMS = [
+      inputSystem,
+      new MovementSystem(ecs,bus),
+      new GravitySystem(ecs,bus),
+      aiSystem,
+      collisionSystem,
+      new DeathSystem(ecs,bus),
+      checkpointSystem,
+      renderSystem,
+      juiceSystem
+    ];
+    for(const s of SYSTEMS) s.initialize();
+
+    aiSystem.bindPlayer(() => {
+      const pid = ecs.query('Transform','PlayerTag')[0]; if(!pid) return 0;
+      return ecs.get(pid,'Transform').x;
+    }, () => {
+      const pid = ecs.query('Transform','PlayerTag')[0]; if(!pid) return 0;
+      return ecs.get(pid,'Transform').y;
+    }, () => 100000);
+  }
+
+  bindInput(){
+    const kb = this.input.keyboard;
+    const setCmd = (c, v) => inputSystem.setCommand(c, v);
+    kb.on('keydown-A', () => setCmd('left', true));
+    kb.on('keyup-A',   () => setCmd('left', false));
+    kb.on('keydown-LEFT', () => setCmd('left', true));
+    kb.on('keyup-LEFT',   () => setCmd('left', false));
+    kb.on('keydown-D', () => setCmd('right', true));
+    kb.on('keyup-D',   () => setCmd('right', false));
+    kb.on('keydown-RIGHT', () => setCmd('right', true));
+    kb.on('keyup-RIGHT',   () => setCmd('right', false));
+    kb.on('keydown-SPACE', () => this.tryJump());
+    kb.on('keydown-UP',    () => this.tryJump());
+    kb.on('keydown-SHIFT', () => this.tryDash());
+    kb.on('keydown-ESC', () => this.scene.pause('GameScene') || this.scene.start('PauseScene'));
+
+    // touch
+    this.input.on('pointerdown', (p) => {
+      if(p.x > this.scale.width/2) this.tryJump();
+      else this.tryDash();
+    });
+  }
+
+  tryJump(){
+    const pid = ecs.query('Transform','PlayerTag')[0]; if(!pid) return;
+    const tag = ecs.get(pid,'PlayerTag');
+    const v = ecs.get(pid,'Velocity');
+    if(tag.onGround){ v.vy = -650; tag.onGround = false;
+      bus.emit('CORE_ACTION_PERFORMED', {cmd:'JUMP'}); juiceSystem.cameraShake(60, 0.0015);
+    }
+  }
+  tryDash(){
+    const pid = ecs.query('Transform','PlayerTag')[0]; if(!pid) return;
+    const v = ecs.get(pid,'Velocity');
+    const t = ecs.get(pid,'Transform');
+    const dir = inputSystem.cmd.left ? -1 : 1;
+    v.vx = 620 * dir;
+    this.tweens.add({targets:t, x: t.x + 40*dir, duration: 60, yoyo:false});
+    juiceSystem.cameraShake(90, 0.002);
+    bus.emit('CORE_ACTION_PERFORMED', {cmd:'DASH'});
+  }
+
+  loadLevel(levelIdx){
+    // clear previous
+    for(const id of Array.from(ecs.entities.keys())) ecs.destroy(id);
+    renderSystem && renderSystem.clearAll();
+
+    const level = GAME_DATA.progression.stages_or_levels[levelIdx];
+    if(!level) { console.warn('No level', levelIdx); return; }
+    SESSION.levelIndex = levelIdx;
+    SESSION.microIndex = 0;
+    this.loadMicroPhase(level.micro_phases[0]);
+    this.currentLevel = level;
+  }
+
+  loadMicroPhase(micro){
+    if(!micro) return;
+    this.currentMicro = micro;
+    // reset statics
+    this.staticRects = [];
+    checkpointSystem.clear();
+
+    // background color from theme
+    const palette = GAME_DATA?.theme?.palette || {};
+    this.cameras.main.setBackgroundColor(palette.bg || '#0a0a12');
+
+    // world bounds
+    const w = (micro.spatial_extent?.width)  || 4000;
+    const h = (micro.spatial_extent?.height) || 720;
+    this.worldW = w; this.worldH = h;
+    this.cameras.main.setBounds(0, 0, w, h);
+
+    // --- gameplay entities ---
+    const rows = micro.world_or_board?.rows || 18;
+    const cols = micro.world_or_board?.cols || 60;
+    const tile = ENGINE_CONFIG.tile;
+
+    // create floor/ground from world_or_board.terrain or default
+    const terrain = micro.world_or_board?.terrain || this.defaultTerrain(rows, cols);
+    for(let r=0;r<rows;r++){
+      for(let c=0;c<cols;c++){
+        if(terrain[r] && terrain[r][c] === 1){
+          const x = c*tile + tile/2;
+          const y = r*tile + tile/2;
+          this.staticRects.push({x: c*tile, y: r*tile, w: tile, h: tile});
+          const id = ecs.create({
+            Transform:{x,y},
+            Sprite:{shape:'rect', w:tile, h:tile, color: this.hexColor(palette.fg || '#6688aa'), layer:'gameplay', z: 0},
+            Collider:{w:tile, h:tile, static:true}
+          });
+        }
+      }
+    }
+
+    // spawn gameplay entities
+    for(const e of micro.entities_in_zone || []){
+      const def = findEntityDef(e.entity_id);
+      if(!def) continue;
+      const px = (e.col != null) ? e.col*tile + tile/2 : Math.random()*w;
+      const py = (e.row != null) ? e.row*tile + tile/2 : 100;
+      this.spawnEntity(def, px, py, e);
+    }
+
+    // player spawn
+    const pid = ecs.create({
+      Transform:{x: 80, y: h - 120},
+      Velocity:{vx:0, vy:0},
+      Collider:{w:26, h:34, static:false},
+      Sprite:{shape:'rect', w:26, h:34, color: this.hexColor(palette.accent || '#ffcc44'), layer:'gameplay', z: 5},
+      Gravity:{},
+      PlayerTag:{ onGround:false },
+      Health:{ hp:1, max:1 },
+      Animated:{ animation_class:'none', interaction_class:'anim-squash' }
+    });
+    this.playerId = pid;
+
+    // camera follow
+    this.cameras.main.startFollow(this._followStub = {x:80, y:h-120, ...({})}, false, ENGINE_CONFIG.cameraLerp, ENGINE_CONFIG.cameraLerp);
+    // custom follow: since we cannot pass entity, we implement in update
+
+    // --- decorative_layout (BACKGROUND + FOREGROUND) ---
+    // NOTE: strict separation: NEVER added to staticRects, NEVER to ECS gameplay queries.
+    for(const d of micro.decorative_layout || []){
+      const def = findEntityDef(d.entity_id);
+      if(!def) continue;
+      const layer = d.render_layer || 'background_mid';
+      const par = d.parallax_factor != null ? d.parallax_factor : (
+        layer === 'background_far' ? 0.15 :
+        layer === 'background_mid' ? 0.40 :
+        layer === 'background_near' ? 0.70 : 0);
+      const inst = d.instance_count || 1;
+      for(let i=0;i<inst;i++){
+        let x, y;
+        if(d.row != null && d.col != null){ x = d.col*tile; y = d.row*tile; }
+        else { x = 40 + Math.random()*(w-80); y = 40 + Math.random()*(h-160); }
+        const size = def.visual?.size || [32,32];
+        const color = this.hexColor(palette[def.visual?.color_key] || palette.fg || '#334455');
+        renderSystem.createDecoration({
+          shape: def.visual?.shape || 'rect',
+          color,
+          w: size[0], h: size[1],
+          x, y,
+          render_layer: layer,
+          z_index: d.z_index || 0,
+          parallax_factor: par
+        });
+      }
+    }
+
+    bus.emit('MICRO_PHASE_STARTED', {micro_level_id: micro.micro_level_id});
+  }
+
+  defaultTerrain(rows, cols){
+    const t = [];
+    for(let r=0;r<rows;r++){
+      t.push(new Array(cols).fill(0));
+    }
+    // ground row
+    for(let c=0;c<cols;c++) t[rows-2][c] = 1;
+    // platforms
+    for(let c=6;c<cols-4;c+=8){
+      t[rows-6][c] = 1; t[rows-6][c+1] = 1;
+    }
+    // pit
+    for(let c=12;c<16;c++) t[rows-2][c] = 0;
+    return t;
+  }
+
+  spawnEntity(def, x, y, placement){
+    const comps = {};
+    const tags = def.tags || [];
+    const palette = GAME_DATA?.theme?.palette || {};
+    const size = def.visual?.size || [24,24];
+    comps.Transform = {x,y};
+    comps.Sprite = {
+      shape: def.visual?.shape || 'rect',
+      w:size[0], h:size[1],
+      color: this.hexColor(palette[def.visual?.color_key] || palette.accent || '#ffffff'),
+      layer: 'gameplay', z: 3
+    };
+    comps.Animated = { animation_class: def.animation_class || 'none', interaction_class: def.interaction_class || 'none' };
+    if(tags.includes('player_tool') || tags.includes('collectible') || tags.includes('enemy') || tags.includes('trap') || tags.includes('checkpoint') || tags.includes('goal')){
+      comps.Collider = { w:size[0], h:size[1], static:false };
+    }
+    if(def.components) Object.assign(comps, JSON.parse(JSON.stringify(def.components)));
+    // tags translated into components
+    if(tags.includes('enemy')){
+      comps.Velocity = comps.Velocity || {vx:0, vy:0};
+      comps.EnemyTag = { behavior:'patrol', alert_radius:220, speed:70, dir:1 };
+      comps.FSM = { current:'patrol', transitions:[] };
+    }
+    if(tags.includes('collectible')) comps.CoinTag = { value: 1 };
+    if(tags.includes('trap')) comps.TrapTag = { kind:'spike' };
+    if(tags.includes('checkpoint')) comps.CheckpointTag = { index: 0 };
+    if(tags.includes('goal')) comps.GoalTag = {};
+    const id = ecs.create(comps);
+    if(tags.includes('checkpoint')){
+      checkpointSystem.register({id, x, y, reached:false});
+    }
+    return id;
+  }
+
+  hexColor(hex){
+    if(typeof hex === 'number') return hex;
+    if(typeof hex !== 'string') return 0xffffff;
+    return parseInt(hex.replace('#',''), 16);
+  }
+
+  nextMicroPhase(){
+    bus.emit('PROGRESS_CHANGED', {delta: 1});
+    // 1 of N upgrade choice
+    const choicePool = GAME_DATA.progression.choice_pool || [];
+    if(choicePool.length){
+      this.scene.pause('GameScene');
+      this.scene.launch('UpgradeScene', {pool: choicePool, onPick: () => {
+        this.advanceMicro();
+        this.scene.resume('GameScene');
+      }});
+    } else {
+      this.advanceMicro();
+    }
+  }
+
+  advanceMicro(){
+    const level = this.currentLevel;
+    SESSION.microIndex++;
+    if(SESSION.microIndex >= level.micro_phases.length){
+      bus.emit('STAGE_COMPLETED', {level: level.level_id});
+      bus.emit('SESSION_ENDED', {score: SESSION.score, coins: SESSION.coins});
+      this.scene.stop('HUDScene');
+      this.scene.start('ResultScene', {score: SESSION.score, coins: SESSION.coins});
+    } else {
+      this.loadMicroPhase(level.micro_phases[SESSION.microIndex]);
+    }
+  }
+
+  respawn(){
+    // mid-stage checkpointing
+    const cp = checkpointSystem.checkpoint;
+    const pid = this.playerId;
+    const t = ecs.get(pid,'Transform'); const v = ecs.get(pid,'Velocity');
+    if(cp){ t.x = cp.x; t.y = cp.y; } else { t.x = 80; t.y = 400; }
+    v.vx = 0; v.vy = 0;
+    juiceSystem.cameraShake(150, 0.008);
+  }
+
+  update(time, delta){
+    const dt = Math.min(delta/1000, 0.05);
+    for(const s of SYSTEMS) s.update(dt);
+    modifiers.tick(dt);
+    // player horizontal input
+    const pid = this.playerId;
+    if(pid && ecs.entities.has(pid)){
+      const v = ecs.get(pid,'Velocity');
+      const sp = modifiers.resolve('player.speed', 300);
+      if(inputSystem.cmd.left)  v.vx = -sp;
+      else if(inputSystem.cmd.right) v.vx = sp;
+      else v.vx *= 0.82;
+      // camera follow
+      const t = ecs.get(pid,'Transform');
+      this.cameras.main.scrollX = Phaser.Math.Linear(this.cameras.main.scrollX, t.x - this.scale.width/2, 0.12);
+      this.cameras.main.scrollY = Phaser.Math.Linear(this.cameras.main.scrollY, t.y - this.scale.height/2, 0.10);
+    }
+    bus.flushQueue();
+  }
+}
+
+class HUDScene extends Phaser.Scene {
+  constructor(){ super('HUDScene'); }
+  create(){
+    this.scoreText = this.add.text(16, 12, '', {color:'#fff', fontSize:'16px', backgroundColor:'#0008', padding:{x:8,y:4}});
+    this.coinText = this.add.text(16, 40, '', {color:'#ffd', fontSize:'16px', backgroundColor:'#0008', padding:{x:8,y:4}});
+    this.hpBar = this.add.rectangle(16, 70, 100, 8, 0xff4455).setOrigin(0,0.5);
+
+    this.updateHUD();
+    bus.on('COIN_COLLECTED', (p) => { SESSION.coins += (p.value||1); SESSION.score += 10; this.updateHUD(); this.flashTween(this.coinText); });
+    bus.on('ENEMY_KILLED',   () => { SESSION.score += 50; this.updateHUD(); });
+    bus.on('PROGRESS_CHANGED', () => this.updateHUD());
+    bus.on('PLAYER_DIED', () => { this.flashTween(this.hpBar); });
+  }
+  updateHUD(){
+    this.scoreText.setText('SCORE: ' + SESSION.score);
+    this.coinText.setText('COINS: ' + SESSION.coins);
+  }
+  flashTween(obj){
+    this.tweens.add({targets:obj, alpha: 0.4, duration: 90, yoyo: true, repeat: 1});
+  }
+}
+
+class PauseScene extends Phaser.Scene {
+  constructor(){ super('PauseScene'); }
+  create(){
+    PlatformAdapter.gameplayStop();
+    bus.emit('GAMEPLAY_STOP', {});
+    const {width:w, height:h} = this.scale;
+    this.add.rectangle(0,0,w,h, 0x000000, 0.7).setOrigin(0);
+    this.add.text(w/2, h*0.3, 'PAUSED', {color:'#fff', fontSize:'40px'}).setOrigin(0.5);
+    this.button(w/2, h*0.45, 'RESUME', () => { this.scene.stop(); this.scene.resume('GameScene'); PlatformAdapter.gameplayStart(); });
+    this.button(w/2, h*0.55, 'SETTINGS', () => { this.scene.pause(); this.scene.launch('SettingsScene', {from:'pause'}); });
+    this.button(w/2, h*0.65, 'MAIN MENU', () => { this.scene.stop('HUDScene'); this.scene.stop('GameScene'); this.scene.start('MenuScene'); });
+  }
+  button(x,y,text,cb){
+    const t = this.add.text(x,y,text,{color:'#fff', fontSize:'22px', backgroundColor:'#222', padding:{x:16,y:8}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+    t.on('pointerdown', cb);
+  }
+}
+
+class ResultScene extends Phaser.Scene {
+  constructor(){ super('ResultScene'); }
+  create(data){
+    const {width:w, height:h} = this.scale;
+    this.add.rectangle(0,0,w,h, 0x0a0a12).setOrigin(0);
+    this.add.text(w/2, h*0.25, 'STAGE COMPLETE', {color:'#fff', fontSize:'36px'}).setOrigin(0.5);
+    this.add.text(w/2, h*0.40, 'Score: ' + (data.score||0), {color:'#eee', fontSize:'22px'}).setOrigin(0.5);
+    this.add.text(w/2, h*0.48, 'Coins: ' + (data.coins||0), {color:'#ffd', fontSize:'22px'}).setOrigin(0.5);
+
+    // persist meta
+    const s = SaveSystem.load();
+    s.coins += (data.coins||0);
+    s.score = Math.max(s.score||0, data.score||0);
+    SaveSystem.save(s);
+
+    const btn = this.add.text(w/2, h*0.65, 'CONTINUE', {color:'#fff', fontSize:'22px', backgroundColor:'#222', padding:{x:16,y:8}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+    btn.on('pointerdown', ()=> this.scene.start('MenuScene'));
+  }
+}
+
+class UpgradeScene extends Phaser.Scene {
+  constructor(){ super('UpgradeScene'); }
+  create(data){
+    const {width:w, height:h} = this.scale;
+    this.add.rectangle(0,0,w,h, 0x000000, 0.75).setOrigin(0);
+    this.add.text(w/2, h*0.25, 'CHOOSE AN UPGRADE', {color:'#fff', fontSize:'26px'}).setOrigin(0.5);
+    const pool = (data.pool||[]).slice(0,3);
+    pool.forEach((up, i) => {
+      const y = h*0.42 + i*60;
+      const btn = this.add.text(w/2, y, up.name, {color:'#fff', fontSize:'20px', backgroundColor:'#333', padding:{x:14,y:6}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+      btn.on('pointerover', () => this.tweens.add({targets:btn, scale:1.05, duration:120}));
+      btn.on('pointerout',  () => this.tweens.add({targets:btn, scale:1,    duration:120}));
+      btn.on('pointerdown', () => {
+        // apply modifier
+        modifiers.add(up.target || 'player.speed', {type: up.type || 'FLAT', value: up.value || 0, source: up.id});
+        const s = SaveSystem.load();
+        s.unlocked_upgrades = s.unlocked_upgrades||[];
+        s.unlocked_upgrades.push(up.id);
+        SaveSystem.save(s);
+        bus.emit('REWARD_GRANTED', {upgrade: up.id});
+        this.scene.stop();
+        data.onPick && data.onPick();
+      });
+    });
+  }
+}
+
+class SettingsScene extends Phaser.Scene {
+  constructor(){ super('SettingsScene'); }
+  create(data){
+    const {width:w, height:h} = this.scale;
+    this.add.rectangle(0,0,w,h, 0x0a0a12).setOrigin(0);
+    this.add.text(w/2, h*0.2, 'SETTINGS', {color:'#fff', fontSize:'28px'}).setOrigin(0.5);
+    const s = SaveSystem.load();
+    const mk = (label, key, y) => {
+      const val = s.settings?.[key];
+      const txt = this.add.text(w/2, y, `${label}: ${typeof val==='number'?val.toFixed(2):val}`, {color:'#eee', fontSize:'18px'}).setOrigin(0.5).setInteractive({useHandCursor:true});
+      txt.on('pointerdown', () => {
+        let v = s.settings[key];
+        if(typeof v === 'number') v = v > 0 ? Math.max(0, v-0.25) : 1;
+        else if(typeof v === 'string') v = v === 'high' ? 'low' : 'high';
+        else v = !v;
+        s.settings[key] = v; SaveSystem.save(s);
+        txt.setText(`${label}: ${typeof v==='number'?v.toFixed(2):v}`);
+      });
+    };
+    mk('Music Volume','music', h*0.32);
+    mk('SFX Volume','sfx', h*0.40);
+    mk('Effects','effects', h*0.48);
+
+    const back = this.add.text(w/2, h*0.7, 'BACK', {color:'#fff', fontSize:'22px', backgroundColor:'#222', padding:{x:16,y:8}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+    back.on('pointerdown', () => {
+      if(data && data.from === 'pause'){ this.scene.stop(); this.scene.resume('PauseScene'); }
+      else this.scene.start('MenuScene');
+    });
+  }
+}
+
+class AchievementsScene extends Phaser.Scene {
+  constructor(){ super('AchievementsScene'); }
+  create(){
+    const {width:w, height:h} = this.scale;
+    this.add.rectangle(0,0,w,h, 0x0a0a12).setOrigin(0);
+    this.add.text(w/2, h*0.15, 'ACHIEVEMENTS', {color:'#fff', fontSize:'26px'}).setOrigin(0.5);
+    const defs = GAME_DATA?.progression?.achievements || [];
+    const s = SaveSystem.load();
+    const got = s.achievements || {};
+    defs.forEach((a, i) => {
+      const y = h*0.28 + i*36;
+      const unlocked = !!got[a.id];
+      this.add.text(w/2, y, (unlocked?'✔ ':'✖ ') + (a.name||a.id), {color: unlocked?'#8f8':'#888', fontSize:'18px'}).setOrigin(0.5);
+    });
+    const back = this.add.text(w/2, h*0.85, 'BACK', {color:'#fff', fontSize:'22px', backgroundColor:'#222', padding:{x:16,y:8}}).setOrigin(0.5).setInteractive({useHandCursor:true});
+    back.on('pointerdown', () => this.scene.start('MenuScene'));
+  }
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+function findEntityDef(id){
+  const e = GAME_DATA?.entities; if(!e) return null;
+  const pools = ['player_or_core_agent','opposing_or_active_forces','player_tools_or_actions','environment_or_context_entities'];
+  for(const p of pools){
+    const arr = e[p]; if(!Array.isArray(arr)) continue;
+    const found = arr.find(x => x.entity_id === id);
+    if(found) return found;
+  }
+  return null;
+}
+
+// ============================================================
+// SYNTHETIC GAME_DATA (test-only; not part of delivery output)
+// ============================================================
+function syntheticGameData(){
+  return {
+    theme:{
+      save_key:'synthetic_platformer_save',
+      palette:{bg:'#0d1020', fg:'#3a4a6a', accent:'#ffcc44', danger:'#ff4455', reward:'#88ff88'},
+      texts:{ title:'Synthetic Platformer' },
+      font:'system-ui',
+      audio:{}
+    },
+    lore:{ world_summary:'Synthetic test world.', tone:'neutral', factions_or_contexts:[], key_concepts:[] },
+    entities:{
+      player_or_core_agent:[],
+      opposing_or_active_forces:[
+        {entity_id:'enemy_slime', tags:['enemy'], animation_class:'anim-idle', interaction_class:'anim-flash',
+         visual:{shape:'rect', color_key:'danger', size:[26,26]}, components:{}}
+      ],
+      player_tools_or_actions:[
+        {entity_id:'coin', tags:['collectible'], animation_class:'anim-pulse', interaction_class:'anim-flash',
+         visual:{shape:'circle', color_key:'reward', size:[18,18]}},
+        {entity_id:'trap_spike', tags:['trap'], animation_class:'none', interaction_class:'none',
+         visual:{shape:'rect', color_key:'danger', size:[32,14]}}
+      ],
+      environment_or_context_entities:[
+        {entity_id:'deco_cloud', tags:['decoration'], animation_class:'none', interaction_class:'none',
+         visual:{shape:'circle', color_key:'fg', size:[120,40]}},
+        {entity_id:'deco_hill', tags:['decoration'], animation_class:'none', interaction_class:'none',
+         visual:{shape:'rect', color_key:'fg', size:[260,90]}},
+        {entity_id:'deco_tree', tags:['decoration'], animation_class:'none', interaction_class:'none',
+         visual:{shape:'rect', color_key:'fg', size:[60,120]}},
+        {entity_id:'checkpoint', tags:['checkpoint'], animation_class:'anim-idle', interaction_class:'none',
+         visual:{shape:'rect', color_key:'accent', size:[24,40]}},
+        {entity_id:'goal', tags:['goal'], animation_class:'anim-pulse', interaction_class:'none',
+         visual:{shape:'rect', color_key:'reward', size:[40,60]}}
+      ]
+    },
+    progression:{
+      stages_or_levels:[{
+        level_id:'lvl_synth_1',
+        name:'Synthetic Level',
+        difficulty_curve:'linear',
+        micro_phases:[
+          {
+            micro_level_id:'mp_1_1', sequence_index:0, phase:'intro',
+            objective:{type:'reach_goal'}, world_or_board:{rows:18, cols:60},
+            spatial_extent:{width:1920, height:576},
+            entities_in_zone:[
+              {entity_id:'coin', instance_count:3, entity_category:'gameplay', row:14, col:8},
+              {entity_id:'enemy_slime', instance_count:1, entity_category:'gameplay', row:14, col:20},
+              {entity_id:'checkpoint', instance_count:1, entity_category:'gameplay', row:14, col:30},
+              {entity_id:'goal', instance_count:1, entity_category:'gameplay', row:14, col:55}
+            ],
+            decorative_layout:[
+              {entity_id:'deco_cloud', instance_count:3, render_layer:'background_far', z_index:0, has_collision:false, parallax_factor:0.15, row:2, col:10},
+              {entity_id:'deco_hill',  instance_count:2, render_layer:'background_mid', z_index:0, has_collision:false, parallax_factor:0.40, row:14, col:12},
+              {entity_id:'deco_tree',  instance_count:4, render_layer:'background_near', z_index:0, has_collision:false, parallax_factor:0.70, row:13, col:6}
+            ]
+          },
+          {
+            micro_level_id:'mp_1_2', sequence_index:1, phase:'challenge',
+            objective:{type:'reach_goal'}, world_or_board:{rows:18, cols:60},
+            spatial_extent:{width:1920, height:576},
+            entities_in_zone:[
+              {entity_id:'trap_spike', instance_count:2, entity_category:'gameplay', row:15, col:15},
+              {entity_id:'coin', instance_count:2, entity_category:'gameplay', row:12, col:22},
+              {entity_id:'goal', instance_count:1, entity_category:'gameplay', row:14, col:55}
+            ],
+            decorative_layout:[
+              {entity_id:'deco_cloud', instance_count:2, render_layer:'background_far', z_index:0, has_collision:false, parallax_factor:0.15, row:3, col:20},
+              {entity_id:'deco_hill', instance_count:1, render_layer:'background_mid', z_index:0, has_collision:false, parallax_factor:0.40, row:14, col:20}
+            ]
+          }
+        ],
+        density_metrics:{ min_encounters:12, min_collectibles:8, min_hazards:6, min_micro_phases:6, target_minutes:[10,15] }
+      }],
+      choice_pool:[
+        {id:'up_speed',   name:'+20% Move Speed', target:'player.speed',      type:'MULT', value:1.20},
+        {id:'up_flat_sp', name:'+40 Move Speed', target:'player.speed',      type:'FLAT', value:40},
+        {id:'up_coin',    name:'+50% Coins',     target:'coin.multiplier',   type:'MULT', value:1.50},
+        {id:'up_hp',      name:'+1 Max HP',      target:'player.max_hp',     type:'FLAT', value:1}
+      ],
+      achievements:[
+        {id:'first_coin',    name:'First Coin'},
+        {id:'first_kill',    name:'First Stomp'},
+        {id:'first_stage',   name:'Stage Complete'},
+        {id:'no_death_run',  name:'Flawless Run'},
+        {id:'checkpoint',    name:'Checkpoint Reached'}
+      ],
+      tutorial:{ steps:[{text:'Move with A/D'},{text:'Jump with SPACE'},{text:'Reach the goal'}] },
+      meta_upgrades:[],
+      difficulty_overrides:{}
+    },
+    assets:{ images:[], audio:[], animations:[], fonts:[], effects:[], placeholders:[] }
+  };
+}
+
+// ============================================================
+// ACHIEVEMENT HOOKS
+// ============================================================
+function wireAchievements(){
+  const award = (id) => {
+    const s = SaveSystem.load();
+    s.achievements = s.achievements || {};
+    if(!s.achievements[id]){
+      s.achievements[id] = true;
+      SaveSystem.save(s);
+      bus.emit('ACHIEVEMENT_UNLOCKED', {id});
+    }
+  };
+  bus.on('COIN_COLLECTED', () => award('first_coin'));
+  bus.on('ENEMY_KILLED',   () => award('first_kill'));
+  bus.on('STAGE_COMPLETED',() => award('first_stage'));
+  bus.on('CHECKPOINT_REACHED', () => award('checkpoint'));
+}
+
+// ============================================================
+// BOOTSTRAP
+// ============================================================
+function boot(){
+  wireAchievements();
+  PlatformAdapter.init();
+
+  const config = {
+    type: Phaser.AUTO,
+    parent: 'game',
+    backgroundColor: '#0a0a12',
+    scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, width: 960, height: 540 },
+    physics: { default: 'arcade', arcade: { gravity:{y:0}, debug: ENGINE_CONFIG.debug } },
+    scene: [BootScene, PreloadScene, MenuScene, GameScene, HUDScene, PauseScene, ResultScene, UpgradeScene, SettingsScene, AchievementsScene],
+    render: { pixelArt: false, antialias: true }
+  };
+  new Phaser.Game(config);
+}
+
+boot();
+</script>
+</body>
+</html>

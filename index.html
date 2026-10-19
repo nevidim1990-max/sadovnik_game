@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#173f3b" />
+    <meta name="description" content="Платформер о маленьком садовнике, который возвращает свет заброшенной оранжерее." />
+    <title>Садовник Оранжереи</title>
+    <style>
+      :root { color-scheme: dark; background: #173f3b; }
+      * { box-sizing: border-box; }
+      html, body, #game { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+      body { background: #173f3b; touch-action: none; overscroll-behavior: none; user-select: none; }
+      #game { position: fixed; inset: 0; }
+      canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+      @media (max-width: 520px) { html, body, #game { min-height: 100dvh; } }
+    </style>
+  </head>
+  <body>
+    <main id="game" aria-label="Игра Садовник Оранжереи"></main>
+    <script src="./game.js"></script>
+  </body>
+</html>

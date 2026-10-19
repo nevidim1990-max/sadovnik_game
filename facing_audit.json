@@ -1,0 +1,62 @@
+[
+  {
+    "uid": "au_player_sprite_entity_001",
+    "reference_id": "entity_001",
+    "template": "humanoid",
+    "declared": "right",
+    "detected": "right",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  },
+  {
+    "uid": "au_enemy_sprite_faction_002",
+    "reference_id": "faction_002",
+    "template": "humanoid",
+    "declared": "left",
+    "detected": "left",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  },
+  {
+    "uid": "au_enemy_sprite_entity_019",
+    "reference_id": "entity_019",
+    "template": "humanoid",
+    "declared": "left",
+    "detected": "left",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  },
+  {
+    "uid": "au_enemy_sprite_entity_016",
+    "reference_id": "entity_016",
+    "template": "humanoid",
+    "declared": "left",
+    "detected": "left",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  },
+  {
+    "uid": "au_enemy_sprite_faction_008",
+    "reference_id": "faction_008",
+    "template": "humanoid",
+    "declared": "left",
+    "detected": "left",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  },
+  {
+    "uid": "au_enemy_sprite_faction_004",
+    "reference_id": "faction_004",
+    "template": "humanoid",
+    "declared": "left",
+    "detected": "left",
+    "view": "side",
+    "action": "none",
+    "result": "PASS"
+  }
+]
