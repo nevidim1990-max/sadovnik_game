@@ -10,14 +10,15 @@
       :root { color-scheme: dark; background: #173f3b; }
       * { box-sizing: border-box; }
       html, body, #game { width: 100%; height: 100%; margin: 0; overflow: hidden; }
-      body { background: #173f3b; touch-action: none; overscroll-behavior: none; user-select: none; }
+      body { background: #173f3b; touch-action: none; overscroll-behavior: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
       #game { position: fixed; inset: 0; }
-      canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+      canvas { display: block; width: 100%; height: 100%; touch-action: none; -webkit-tap-highlight-color: transparent; }
       @media (max-width: 520px) { html, body, #game { min-height: 100dvh; } }
     </style>
   </head>
   <body>
     <main id="game" aria-label="Игра Садовник Оранжереи"></main>
     <script src="./game.js"></script>
+    <script src="./responsive-fixes.js"></script>
   </body>
 </html>
