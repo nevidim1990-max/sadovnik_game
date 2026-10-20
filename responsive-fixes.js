@@ -8,8 +8,11 @@
     navigator.maxTouchPoints > 0 ||
     window.matchMedia?.("(pointer: coarse)").matches ||
     "ontouchstart" in window;
+  const touchControlsEnabled =
+    window.matchMedia?.("(pointer: coarse)").matches ?? touchDevice;
 
   const pixelRatio = () => Math.min(3, Math.max(1, window.devicePixelRatio || 1));
+  const tutorialKey = "sadovnik-first-level-tutorial-v1";
 
   if (touchDevice) {
     game.device.input.touch = true;
@@ -19,57 +22,73 @@
     }
   }
 
-  function addGuide(scene) {
-    if (scene.__responsiveGuide?.items?.every(({ plate }) => plate.active)) {
-      return scene.__responsiveGuide;
+  function showFirstRunTutorial(scene) {
+    if (scene.__firstRunTutorialChecked || scene.macroIndex !== 0 || scene.microIndex !== 0) return;
+    scene.__firstRunTutorialChecked = true;
+
+    try {
+      if (localStorage.getItem(tutorialKey)) return;
+    } catch {}
+
+    const keys = touchControlsEnabled
+      ? ["◀ ▶", "↑", "✦"]
+      : ["A / D", "SPACE", "SHIFT / X"];
+    const labels = ["ДВИЖЕНИЕ", "ПРЫЖОК", "ПОРЫВ"];
+    const icons = touchControlsEnabled ? ["◀ ▶", "↑", "✦"] : ["↔", "↑", "✦"];
+    const root = document.createElement("div");
+    root.className = "first-run-tutorial";
+    if (touchControlsEnabled) root.classList.add("first-run-tutorial--touch");
+    root.setAttribute("role", "dialog");
+    root.setAttribute("aria-modal", "true");
+    root.setAttribute("aria-label", "Управление в игре");
+    root.innerHTML = `
+      <section class="first-run-tutorial__panel">
+        <h2>В ПУТЬ</h2>
+        <div class="first-run-tutorial__cards">
+          ${labels.map((label, index) => `
+            <div class="first-run-tutorial__card">
+              <span class="first-run-tutorial__icon" aria-hidden="true">${icons[index]}</span>
+              <span class="first-run-tutorial__label">${label}</span>
+              <kbd>${keys[index]}</kbd>
+            </div>
+          `).join("")}
+        </div>
+        <button class="first-run-tutorial__start" type="button">ПОНЯТНО</button>
+      </section>`;
+
+    if (!document.getElementById("first-run-tutorial-styles")) {
+      const style = document.createElement("style");
+      style.id = "first-run-tutorial-styles";
+      style.textContent = `
+        .first-run-tutorial{position:fixed;inset:0;z-index:10000;display:grid;place-items:center;padding:16px;background:rgba(7,23,20,.82);font-family:Arial,sans-serif;color:#fff2d0}
+        .first-run-tutorial__panel{width:min(100%,460px);max-height:calc(100dvh - 32px);overflow:auto;padding:28px 24px 22px;border:1px solid rgba(213,228,188,.35);border-radius:22px;background:linear-gradient(150deg,#21584b,#123b36 72%);box-shadow:0 22px 70px #061613aa;text-align:center}
+        .first-run-tutorial__panel h2{margin:0 0 22px;color:#f4c95d;font-size:clamp(24px,7vw,34px);letter-spacing:.1em}
+        .first-run-tutorial__cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}
+        .first-run-tutorial__card{display:flex;min-width:0;min-height:126px;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:10px 5px;border:1px solid #88b58a66;border-radius:15px;background:#0c302b99}
+        .first-run-tutorial__icon{display:grid;width:58px;height:48px;place-items:center;color:#f4c95d;font-size:30px;font-weight:700;white-space:nowrap}
+        .first-run-tutorial__label{font-size:10px;font-weight:700;letter-spacing:.07em}
+        .first-run-tutorial__card kbd{max-width:100%;color:#e7e8d4;font:700 11px Arial,sans-serif;white-space:nowrap}
+        .first-run-tutorial--touch .first-run-tutorial__card kbd{display:none}
+        .first-run-tutorial__start{width:100%;min-height:48px;margin-top:18px;border:0;border-radius:12px;background:#f4c95d;color:#173f3b;font-size:15px;font-weight:800;letter-spacing:.06em;cursor:pointer}
+        .first-run-tutorial__start:focus-visible{outline:3px solid #fff2d0;outline-offset:3px}
+        @media(max-width:360px){.first-run-tutorial__panel{padding:22px 14px 16px}.first-run-tutorial__cards{gap:6px}.first-run-tutorial__card{min-height:106px}.first-run-tutorial__icon{width:58px;height:40px;font-size:26px}.first-run-tutorial__label{font-size:9px}.first-run-tutorial__card kbd{font-size:10px}}
+      `;
+      document.head.appendChild(style);
     }
 
-    const definitions = [
-      ["← →", "ИДТИ"],
-      ["↑", "ПРЫЖОК"],
-      ["⚡", "ПОРЫВ"],
-    ];
-    const items = definitions.map(([icon, label]) => {
-      const plate = scene.add.rectangle(0, 0, 100, 58, 0x123f39, 0.94)
-        .setOrigin(0.5)
-        .setStrokeStyle(1, 0x88b58a, 0.8)
-        .setDepth(20);
-      const symbol = scene.add.text(0, -8, icon, {
-        fontFamily: "Arial, sans-serif",
-        fontSize: "23px",
-        fontStyle: "bold",
-        color: "#f4c95d",
-        align: "center",
-      }).setOrigin(0.5).setDepth(21);
-      const caption = scene.add.text(0, 18, label, {
-        fontFamily: "Arial, sans-serif",
-        fontSize: "10px",
-        fontStyle: "bold",
-        color: "#fff2d0",
-        align: "center",
-      }).setOrigin(0.5).setDepth(21);
-      return { plate, symbol, caption };
-    });
+    document.body.appendChild(root);
+    try {
+      localStorage.setItem(tutorialKey, "1");
+    } catch {}
+    game.scene.pause("GameScene");
 
-    scene.__responsiveGuide = { items };
-    return scene.__responsiveGuide;
-  }
-
-  function layoutGuide(scene, width, height, y, visible = true) {
-    const guide = addGuide(scene);
-    const margin = width < 360 ? 14 : 20;
-    const gap = 7;
-    const cardWidth = Math.min(180, (width - margin * 2 - gap * 2) / 3);
-    const left = (width - (cardWidth * 3 + gap * 2)) / 2;
-    const ratio = pixelRatio();
-    guide.items.forEach(({ plate, symbol, caption }, index) => {
-      const x = left + cardWidth / 2 + index * (cardWidth + gap);
-      plate.setPosition(x, y).setSize(cardWidth, 58).setVisible(visible);
-      symbol.setPosition(x, y - 8).setFontSize(`${Math.min(24, width * 0.06)}px`)
-        .setResolution(ratio).setVisible(visible);
-      caption.setPosition(x, y + 18).setFontSize(width < 360 ? "9px" : "10px")
-        .setResolution(ratio).setVisible(visible);
-    });
+    const close = () => {
+      root.remove();
+      game.scene.resume("GameScene");
+    };
+    root.querySelector("button").addEventListener("click", close, { once: true });
+    root.addEventListener("pointerdown", (event) => event.stopPropagation());
+    requestAnimationFrame(() => root.querySelector("button")?.focus());
   }
 
   function fitCompactScreens(scene) {
@@ -80,42 +99,23 @@
 
     if (scene.scene.key === "MenuScene") {
       const title = texts.find((item) => item.text === "Садовник Оранжереи");
-      const intro = texts.find((item) =>
-        item.text.startsWith("Ты — крошечный садовник-дух") ||
-        item.text === "Собирай семена и найди Солнечный цветок."
-      );
       const sound = scene.children.list.find((item) =>
         item.type === "Container" && item.getData("buttonCaption")?.text.startsWith("Звук")
       );
-      const buttons = scene.children.list.filter((item) =>
-        item.type === "Container" && item.getData("buttonCaption") &&
-        !item.getData("buttonCaption").text.startsWith("Звук")
-      );
-
       sound?.setVisible(!(width < 430 && height < 480));
-      if (intro) {
-        intro.setText("Собирай семена и найди Солнечный цветок.")
-          .setPosition(width / 2, height * 0.22)
-          .setStyle({ fontSize: compact ? "16px" : "19px", align: "center" })
-          .setWordWrapWidth(Math.max(220, width - 48));
-      }
+      texts.forEach((item) => {
+        if (item !== title) item.setVisible(false);
+      });
 
       if (title) {
         title.setPosition(width / 2, height * (compact ? 0.14 : 0.15))
           .setStyle({ fontSize: width < 360 ? "23px" : width < 760 ? "26px" : "40px", align: "center" })
           .setWordWrapWidth(width - 40);
       }
-
-      const guideY = Math.min(height * 0.355, (buttons[0]?.y ?? height * 0.48) - 60);
-      layoutGuide(scene, width, height, guideY, height >= 600 && width >= 320);
     }
 
     if (scene.scene.key === "IntroScene") {
       const title = texts.find((item) => item.text === "Пробуждение оранжереи");
-      const story = texts.find((item) =>
-        item.text.length > 70 ||
-        item.text === "Собери семена, перепрыгни шипы и найди Солнечный цветок."
-      );
       const buttons = scene.children.list.filter((item) =>
         item.type === "Container" && item.getData("buttonCaption")
       );
@@ -123,17 +123,13 @@
       title?.setPosition(width / 2, height * 0.14)
         .setStyle({ fontSize: width < 430 ? "24px" : "32px", align: "center" })
         .setWordWrapWidth(width - 40);
-      story?.setText("Собери семена, перепрыгни шипы и найди Солнечный цветок.")
-        .setPosition(width / 2, height * (height < 560 ? 0.4 : 0.32))
-        .setStyle({ fontSize: width < 430 ? "16px" : "19px", align: "center" })
-        .setWordWrapWidth(width - 48);
+      texts.forEach((item) => {
+        if (item !== title) item.setVisible(false);
+      });
 
       if (height >= 560 && width >= 320) {
-        layoutGuide(scene, width, height, height * 0.47, true);
         buttons[0]?.setPosition(width / 2, height * 0.7);
         buttons[1]?.setPosition(width / 2, height * 0.8);
-      } else {
-        layoutGuide(scene, width, height, height * 0.47, false);
       }
     }
 
@@ -284,10 +280,11 @@
       const previousButtons = this.touchButtons.slice();
       resize.call(this, width, height);
 
-      const touchControls = touchDevice || width < 760;
-      if (!touchControls) previousButtons.forEach(({ hint }) => hint?.destroy());
-      if (!touchControls && this.touchButtons.length) {
-        this.touchButtons.forEach(({ plate, caption }) => {
+      const touchControls = touchControlsEnabled;
+      this.pauseButton?.setVisible(touchControls);
+      if (!touchControls) {
+        new Set([...previousButtons, ...this.touchButtons]).forEach(({ plate, caption, hint }) => {
+          hint?.destroy();
           plate.destroy();
           caption.destroy();
         });
@@ -384,6 +381,7 @@
         const result = createLevel.apply(this, args);
         patchHud(this.hud);
         scheduleFit(this);
+        showFirstRunTutorial(this);
         return result;
       };
 
